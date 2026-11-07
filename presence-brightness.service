@@ -1,0 +1,19 @@
+[Unit]
+Description=Webcam presence-controlled display brightness
+# needs the camera, and the ability to reach your monitors
+After=default.target
+
+[Service]
+ExecStart=%h/Documents/projects/camera-saver/.venv/bin/python %h/Documents/projects/camera-saver/presence_brightness.py
+Restart=on-failure
+RestartSec=10
+# keep it quiet and tiny
+StandardOutput=journal
+SyslogIdentifier=presence-brightness
+
+# hard resource caps
+MemoryMax=400M
+CPUQuota=2%
+
+[Install]
+WantedBy=default.target
