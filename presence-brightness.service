@@ -4,7 +4,7 @@ Description=Webcam presence-controlled display brightness
 After=default.target
 
 [Service]
-ExecStart=%h/Documents/projects/camera-saver/.venv/bin/python %h/Documents/projects/camera-saver/presence_brightness.py
+ExecStart=%h/Documents/projects/screen-sentry/.venv/bin/python %h/Documents/projects/screen-sentry/presence_brightness.py
 Restart=on-failure
 RestartSec=10
 # keep it quiet and tiny

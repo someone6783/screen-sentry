@@ -3,13 +3,15 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-if [ ! -d .venv ]; then
+# exists and actually works (guards against venvs created/copied elsewhere)
+if [ ! -x .venv/bin/python3 ] || ! .venv/bin/python3 -m pip --version >/dev/null 2>&1; then
   echo "creating venv…"
+  rm -rf .venv
   python3 -m venv .venv
 fi
 
 echo "installing dependencies…"
-.venv/bin/pip install -q -r requirements.txt
+.venv/bin/python3 -m pip install -q -r requirements.txt
 
 echo "installing service…"
 mkdir -p ~/.config/systemd/user
