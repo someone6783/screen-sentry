@@ -4,6 +4,7 @@ Description=Webcam presence-controlled display brightness
 After=default.target
 
 [Service]
+Environment=PYTHONUNBUFFERED=1
 ExecStart=%h/Documents/projects/screen-sentry/.venv/bin/python %h/Documents/projects/screen-sentry/presence_brightness.py
 Restart=on-failure
 RestartSec=10
