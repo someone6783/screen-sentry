@@ -39,6 +39,54 @@ POLL_SECONDS = 3
 LEVELS = range(10, 101, 10)
 
 
+# --- icon names with content-hash suffix (panel cache-busting) ---------------
+STATES = ("screen-sentry", "screen-sentry-manual", "screen-sentry-paused")
+
+
+def icon_search_paths():
+    """[symlink dir, assets dir].
+
+    Panels cache rendered icons by NAME, so regenerating an asset in place
+    keeps showing the old bitmap until a hover re-reads it. Names that embed
+    the asset file's content hash change only when the picture actually
+    changed, forcing the panel to re-render — and symlinks live in the cache
+    dir so the repo tree stays clean.
+    """
+    cache = os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+        "screen-sentry-tray-icons",
+    )
+    os.makedirs(cache, exist_ok=True)
+    import hashlib
+
+    hashed = {}
+    for base in STATES:
+        path = os.path.join(ICON_DIR, base + ".png")
+        try:
+            with open(path, "rb") as f:
+                digest = hashlib.md5(f.read()).hexdigest()[:8]
+        except OSError:
+            continue   # asset missing: plain name falls back to theme icons
+        name = f"{base}-{digest}"
+        link = os.path.join(cache, name + ".png")
+        if not os.path.islink(link):
+            try:
+                if os.path.lexists(link):
+                    os.remove(link)
+                os.symlink(path, link)
+            except OSError:
+                pass
+        hashed[base] = name
+    # drop leftovers from previous runs with an older picture
+    for stale in os.listdir(cache):
+        if stale.endswith(".png") and stale[:-4] not in hashed.values():
+            try:
+                os.remove(os.path.join(cache, stale))
+            except OSError:
+                pass
+    return [cache, ICON_DIR]
+
+
 # --- daemon client (HTTP semantics over a unix socket) ----------------------
 class _UnixConnection(http.client.HTTPConnection):
     def __init__(self, path):
@@ -78,6 +126,11 @@ class Tray:
             AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS,
         )
         self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+        try:  # symlink dir first, then the raw assets dir as fallback
+            self.indicator.set_icon_theme_search_path(icon_search_paths())
+        except Exception:  # older bindings may not have it
+            pass
+        self._icon_hash = {}
         self._icon("screen-sentry")
         self._menu_signature = None
         self._build_menu(None)
@@ -85,14 +138,12 @@ class Tray:
         GLib.timeout_add_seconds(POLL_SECONDS, self.refresh)
 
     def _icon(self, name):
-        try:  # theme lookup with our assets dir searched first
-            self.indicator.set_icon_theme_search_path([ICON_DIR])
-        except Exception:  # older bindings may not have it
-            pass
+        # swap in the content-hashed name so the panel re-renders fresh art
+        hashed = self._icon_hash.get(name, name)
         if hasattr(self.indicator, "set_icon_full"):
-            self.indicator.set_icon_full(name, "screen-sentry")
+            self.indicator.set_icon_full(hashed, "screen-sentry")
         else:
-            self.indicator.set_icon(name)
+            self.indicator.set_icon(hashed)
 
     def refresh(self, *_):
         try:
