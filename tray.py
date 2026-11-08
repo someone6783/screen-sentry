@@ -122,6 +122,7 @@ class Tray:
 
         signature = (
             st["state"], st["present"], st["paused"], st["override"], st["last_set"],
+            st.get("holder"),
         )
         if signature != self._menu_signature:
             self._menu_signature = signature
@@ -200,6 +201,8 @@ class Tray:
     def _status_text(st):
         if st["paused"]:
             return "paused — daemon running, brightness untouched"
+        if st.get("holder"):
+            return f"camera shared with {st['holder']} — screen stays on"
         level = st["last_set"]
         mode = f"manual cap {st['override']}%" if st["override"] is not None else (
             "auto (day full)" if st["state"] == "present" else "auto"

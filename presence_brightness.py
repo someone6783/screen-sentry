@@ -6,9 +6,11 @@ If no one is in front of the webcam, brightness goes to 0.
 If a person is present, brightness goes to max during the day and half otherwise.
 
 Designed to be tiny: one 320x240 frame every 3s, YuNet face detector (a small
-ONNX model, CPU-only; Haar cascades as fallback). Zero GPU usage. Runs as a
-plain background process (or systemd user service). Measured: ~230 MB RAM,
-≤ ~0.5% of one CPU core, 0 VRAM.
+ONNX model, CPU-only; Haar cascades as fallback). Zero GPU usage. Runs as a tiny background process: one 320x240 frame every 3s, YuNet face
+detector (a small ONNX model, CPU-only; Haar cascades as fallback). Zero GPU
+usage. The camera is held open only while sampling, so other programs
+(video calls in Google Chrome etc.) can grab it between checks; while anyone
+else holds it, this daemon backs off and keeps the screen on until it's free.
 
 Usage:
   python3 presence_brightness.py            # run
@@ -34,6 +36,8 @@ Tray icon (tray.py, started automatically after ./setup.sh):
 import json
 import os
 import re
+import faulthandler
+import signal
 import socketserver
 import subprocess
 import sys
@@ -45,6 +49,7 @@ import cv2
 
 # --- config ---------------------------------------------------------------
 CAMERA_INDEX = 0
+CAMERA_DEVICE = f"/dev/video{CAMERA_INDEX}"   # for the camera-share probe
 SAMPLE_INTERVAL_ABSENT = 3  # seconds between checks (always, constant)
 SAMPLE_INTERVAL_PRESENT = 3 # same at both ends of the state: constant checking
 
@@ -58,6 +63,100 @@ BRIGHTNESS_HALF = 50
 # "day time" window; inside it -> full, outside -> half
 DAY_START = 7 * 60          # 07:00 — from here full brightness
 DAY_END = 18 * 60 + 30      # 18:30 — after this half brightness
+
+# live sensor reference + sharing state, shared with the watcher thread
+_sensor = None            # current PresenceSensor (may be replaced on errors)
+cam_holder_text = None    # text describing the other holder, if any
+
+
+# --- camera sharing watcher -------------------------------------------------
+def _fuser_holders():
+    """[(pid, comm), ...] holding the camera, via one `fuser -v` call (a tiny
+    C tool - cheap enough for this daemon's strict CPU budget, and its verbose
+    table already carries the holder's name, so no second ps child needed).
+    Returns None while the probe can't run."""
+    # run outside this unit's CPU quota (CPUQuota is shared by everything we
+    # spawn, and the probe competes with ddcutil + cv2)
+    unit = f"screen-sentry-camprobe-{int(time.time() * 1000) % 100000000}"
+    try:
+        r = subprocess.run(
+            ["systemd-run", "--user", "--collect", "--pipe", "-q",
+             f"--unit={unit}", "fuser", "-v", CAMERA_DEVICE],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        # systemd-run unavailable: plain child inside our own quota then
+        try:
+            r = subprocess.run(["fuser", "-v", CAMERA_DEVICE],
+                               capture_output=True, text=True, timeout=20)
+        except subprocess.SubprocessError:
+            return None
+    # pids land on stdout; the verbose name table (stderr) has one row per
+    # holder like "/dev/video0: aaron F.... sleep" (pid column though is left
+    # blank on non-tty output) — combine them positionally for display text
+    holders = []
+    try:
+        pids = [int(p) for p in (r.stdout or "").split()]
+        comms = []
+        for line in (r.stderr or "").splitlines():
+            fields = line.split()
+            # holder rows carry an ACCESS field like "F...." / "F....."; the
+            # header row ("USER PID ACCESS COMMAND") doesn't
+            if len(fields) >= 4 and "." in fields[-2]:
+                comms.append(fields[-1])
+        for i, pid in enumerate(pids):
+            if pid == os.getpid():   # our own sampling window
+                continue
+            holders.append((pid, comms[i] if i < len(comms) else f"pid {pid}"))
+    except (ValueError, IndexError):
+        # garbled output: report no holders rather than wedge state handling
+        return []
+    return holders
+
+
+def camera_watch_loop(interval=8.0):
+    """Background check: if another program has the camera open (video call
+    etc.), release ours at once (the main loop may be busy in slow DDC
+    verification) and treat the samples as "present" until it is free.
+    Runs at a low cadence: the yield only needs seconds-scale reaction, and
+    this daemon runs under a strict CPU budget."""
+    global cam_holder_text
+    print(f"{stamp()} camera watcher thread started (probing every {interval}s)")
+    failures = 0
+    while True:
+        try:
+            holders = _fuser_holders()
+        except Exception as e:   # never let a probe hiccup kill this thread
+            print(f"{stamp()} camera probe error: {e}; retrying")
+            holders = None
+        if holders is None:
+            failures += 1
+            if failures % 3 == 1:   # don't spam, but don't disappear silently
+                print(
+                    f"{stamp()} warning: camera-share probe unavailable "
+                    f"({failures} failure(s)) — retrying"
+                )
+        else:
+            if failures >= 6:
+                print(f"{stamp()} camera-share probe is usable again")
+            failures = 0
+            text = None
+            if holders:
+                text = ", ".join(f"{name}(pid {pid})" for pid, name in holders)
+            if text != cam_holder_text:
+                cam_holder_text = text
+                if text is not None:
+                    sensor = _sensor
+                    if sensor is not None:
+                        sensor.close()   # stop holding the device ourselves
+                    print(
+                        f"{stamp()} camera in use by {text} — backing off "
+                        "(cam control paused, screen stays on)"
+                    )
+                else:
+                    print(f"{stamp()} camera free again — webcam control resumes")
+        time.sleep(interval)
+
 
 # --- detection --------------------------------------------------------------
 GRAB_WIDTH = 320            # camera frame; YuNet gets this size directly
@@ -103,9 +202,13 @@ _paused = False     # tray: stop touching brightness, daemon keeps running
 _override = None    # tray: cap applied while someone is present (None = auto)
 STATUS = {          # snapshot for GET /status, updated by the main loop
     "state": "starting", "present": False, "paused": False,
-    "override": None, "last_set": None,
+    "override": None, "holder": None, "last_set": None,
 }
 # -------------------------------------------------------------------------
+
+
+# `kill -USR2 <pid>` dumps all thread stacks to the journal (debugging aid)
+faulthandler.register(signal.SIGUSR2)
 
 
 def detect_brightness_backend():
@@ -284,6 +387,8 @@ def start_preview_server():
 def _grab_preview_frame(sensor, status_text):
     """Grab one frame, annotate it, publish it for the preview stream."""
     global _preview_jpeg
+    if sensor.cap is None or not sensor.cap.isOpened():
+        return  # camera released / shared with another app right now
     ok, frame = sensor.cap.read()
     if not ok or frame is None:
         return
@@ -329,7 +434,14 @@ class _ControlHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/status":
-            self._send(200, dict(STATUS))
+            # live values, not the main-loop snapshot: holder/paused change on
+            # other threads and the main loop can be stuck in slow DDC verify
+            # for minutes — the tray still needs to see them right away
+            obj = STATUS.copy()
+            obj["paused"] = _paused
+            obj["override"] = _override
+            obj["holder"] = cam_holder_text
+            self._send(200, obj)
         else:
             self._send(404, {"error": "not found"})
 
@@ -401,19 +513,32 @@ CASCADE_PATHS = [
 class PresenceSensor:
     cascades = [cv2.CascadeClassifier(p) for p in CASCADE_PATHS]
 
-    def __init__(self):
+    def __init__(self, persistent=False):
         cv2.setNumThreads(2)     # keep OpenCV's thread pool from spinning CPU
-        self.cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
-        if self.cap.isOpened():
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, GRAB_WIDTH)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, GRAB_HEIGHT)
+        # persistent: hold /dev/videoX open (needed by --preview). Otherwise
+        # duty-cycle: open -> grab -> release each check, so other programs
+        # (video calls etc.) can use the camera between our samples.
+        self.persistent = persistent
+        self.cap = None
+        self._lock = threading.Lock()   # camera watching thread may release us
+        if self.persistent:
+            self._open()
         self.n_surveys = 0
         self.detector = None     # YuNet, lazily built on first frame
         self.last_score = None   # confidence of the last positive detection
 
-    def close(self):
+    def _open(self):
+        self.cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
         if self.cap.isOpened():
-            self.cap.release()
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, GRAB_WIDTH)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, GRAB_HEIGHT)
+        return self.cap
+
+    def close(self):
+        with self._lock:
+            if self.cap is not None and self.cap.isOpened():
+                self.cap.release()
+        self.cap = None
 
     def _ensure_detector(self, frame):
         """YuNet must match the actual frame size the camera delivers."""
@@ -424,21 +549,32 @@ class PresenceSensor:
         self.detector.setInputSize((w, h))
 
     def present(self) -> bool:
-        if not self.cap.isOpened():
-            raise RuntimeError("camera not open")
-        ok, frame = self.cap.read()
-        if not ok or frame is None:
-            raise RuntimeError("frame grab failed")
-        self.last_score = None
+        with self._lock:
+            if self.cap is None:
+                self._open()        # duty-cycled mode: acquire for this sample
+            if not self.cap.isOpened():
+                raise RuntimeError("camera busy or failed to open")
+            try:
+                ok, frame = self.cap.read()
+                if not ok or frame is None:
+                    raise RuntimeError("frame grab failed")
+                self.last_score = None
 
-        if os.path.isfile(MODEL_PATH):
-            if self.detector is None:
-                self._ensure_detector(frame)
-            _, faces = self.detector.detect(frame)
-            if faces is not None and len(faces) > 0:
-                self.last_score = float(faces[:, 14].max())
-                return True
-            return False
+                if os.path.isfile(MODEL_PATH):
+                    if self.detector is None:
+                        self._ensure_detector(frame)
+                    _, faces = self.detector.detect(frame)
+                    result = (
+                        faces is not None
+                        and len(faces) > 0
+                    )
+                    if result:
+                        self.last_score = float(faces[:, 14].max())
+                    return result
+            finally:
+                if not self.persistent:
+                    self.cap.release()
+                    self.cap = None
 
         # Haar fallback (less robust to tilted/turned heads)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -474,6 +610,7 @@ def target_brightness(present):
 
 
 def main():
+    global _sensor
     dry_run = "--dry-run" in sys.argv
     once = "--once" in sys.argv
 
@@ -484,10 +621,14 @@ def main():
 
     start_control_server()
 
-    sensor = PresenceSensor()
-    if not sensor.cap.isOpened():
+    sensor = PresenceSensor(persistent=PREVIEW)
+    _sensor = sensor
+    if PREVIEW and not sensor.cap.isOpened():
         sys.exit(f"cannot open camera {CAMERA_INDEX}")
     print(f"camera {CAMERA_INDEX} open — checking every {SAMPLE_INTERVAL_ABSENT}s")
+    if not PREVIEW:
+        print("(camera shared: opened briefly per check, other apps free to use it)")
+    threading.Thread(target=camera_watch_loop, daemon=True).start()
 
     preview_port = None
     if PREVIEW:
@@ -507,6 +648,7 @@ def main():
             present=present_since is not None,
             paused=_paused,
             override=_override,
+            holder=cam_holder_text,
             last_set=None if last_set < 0 else last_set,
         )
 
@@ -526,16 +668,23 @@ def main():
                 else SAMPLE_INTERVAL_ABSENT
             )
             t0 = time.monotonic()
-            try:
-                detected = sensor.present()
-            except RuntimeError as e:
-                print(f"camera error: {e}; retrying in {BACKOFF_ON_ERROR}s")
-                time.sleep(BACKOFF_ON_ERROR)
-                sensor.close()
-                sensor = PresenceSensor()
-                if not sensor.cap.isOpened():
-                    print("camera re-open failed, will keep retrying")
-                continue
+
+            # the camera watcher thread decides when to give the camera away;
+            # while someone else holds it, a video call means "present"
+            if cam_holder_text is not None:
+                detected = True
+            else:
+                try:
+                    detected = sensor.present()
+                except RuntimeError as e:
+                    print(f"camera error: {e}; retrying in {BACKOFF_ON_ERROR}s")
+                    time.sleep(BACKOFF_ON_ERROR)
+                    sensor.close()
+                    sensor = PresenceSensor(persistent=PREVIEW)
+                    _sensor = sensor
+                    if not (sensor.cap and sensor.cap.isOpened()):
+                        print("camera re-open failed, will keep retrying")
+                    continue
 
             now = time.monotonic()
             if detected:

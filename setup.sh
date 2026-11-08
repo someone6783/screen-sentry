@@ -9,6 +9,13 @@ if [ ! -x .venv/bin/python3 ] || ! .venv/bin/python3 -m pip --version >/dev/null
   rm -rf .venv
   python3 -m venv .venv
 fi
+# console scripts with stale shebangs (venv copied from another project) are
+# unusable even when `python -m pip` works — detect and rebuild
+if [ ! -x .venv/bin/pip ] || ! head -1 .venv/bin/pip | grep -q "^#!.*$(basename "$PWD")/.venv/bin/python"; then
+  echo "venv has stale shebangs — rebuilding…"
+  rm -rf .venv
+  python3 -m venv .venv
+fi
 
 echo "installing dependencies…"
 .venv/bin/python3 -m pip install -q -r requirements.txt
